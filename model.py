@@ -11,25 +11,14 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
-from torch.nn.attention.flex_attention import (
-    _mask_mod_signature,
-    BlockMask,
-    flex_attention,
-)
+
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
     return n + k - (n % k)
-
-
-def get_mask_mod(mask_mod: _mask_mod_signature, offset: int):
-    def _mask_mod(b, h, q, kv):
-        return mask_mod(b, h, q + offset, kv)
-
-    return _mask_mod
-
 
 @dataclass
 class ModelArgs:
@@ -101,16 +90,6 @@ class KVCache(nn.Module):
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
 
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
-
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
-
-        return k_out, v_out
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -126,7 +105,6 @@ class Transformer(nn.Module):
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
         self.max_seq_length = -1
-        self.get_mask_mod = get_mask_mod
 
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
@@ -146,14 +124,13 @@ class Transformer(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
 
-    def forward(self, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, input_lengths = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, input_pos, freqs_cis, mask)
+            x = layer(x, input_pos, freqs_cis, input_lengths)
         x = self.norm(x)
         logits = self.output(x)
         return logits
@@ -171,8 +148,8 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: BlockMask) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, input_lengths=None) -> Tensor:
+        h = x + self.attention(self.attention_norm(x), freqs_cis, input_pos, input_lengths)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -201,31 +178,126 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, input_pos: Optional[Tensor] = None, input_lengths=None) -> Tensor:
         bsz, seqlen, _ = x.shape
 
+        # Project input to query, key, value
         kv_size = self.n_local_heads * self.head_dim
         q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
+        # Reshape into [bsz, seqlen, num_heads, head_dim]
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
+        # Apply rotary embeddings
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        # Transpose to [bsz, num_heads, seqlen, head_dim] for Flash Attention
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+        # Check if in decoding mode (autoregressive step)
+        is_decoding = input_pos is not None and input_pos.shape[-1] == 1
 
-        y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+        if is_decoding:
+            # Current sequence lengths in the cache for each batch element
+            cache_seqlens = input_pos.squeeze(-1).contiguous()
 
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+            # Transpose q, k, v for Flash Attention's expected input shapes
+            q_decoding = q.transpose(1, 2)  # [bsz, seqlen=1, n_head, head_dim]
+            k_decoding = k.transpose(1, 2)  # [bsz, seqlen=1, n_local_heads, head_dim]
+            v_decoding = v.transpose(1, 2)
 
+            # Transpose KV cache to [bsz, seqlen_cache, n_local_heads, head_dim]
+            k_cache = self.kv_cache.k_cache.transpose(1, 2)
+            v_cache = self.kv_cache.v_cache.transpose(1, 2)
+
+            # Compute attention with in-place cache update
+            y = flash_attn_with_kvcache(
+                q_decoding,
+                k_cache,
+                v_cache,
+                k=k_decoding,
+                v=v_decoding,
+                cache_seqlens=cache_seqlens,
+                causal=True,
+                rotary_cos=None,  # Already applied rotary embeddings
+                rotary_sin=None,
+            )
+
+            # Transpose output back to [bsz, n_head, seqlen=1, head_dim]
+            y = y.transpose(1, 2)
+
+        else:
+            # Prefill phase with variable or fixed sequence lengths
+            if input_lengths is not None:
+                input_lengths = torch.tensor(input_lengths, device=x.device, dtype=torch.int32)
+                cu_seqlens = torch.cat([
+                    torch.zeros(1, dtype=torch.int32, device=x.device),
+                    input_lengths.cumsum(dim=0, dtype=torch.int32)
+                ])
+                max_seqlen = input_lengths.max().item()
+
+                # Pack q, k, v by removing padding tokens
+                q_packed, k_packed, v_packed = [], [], []
+                for i in range(bsz):
+                    l = input_lengths[i]
+                    q_packed.append(q[i, :, :l])  # [n_head, l, head_dim]
+                    k_packed.append(k[i, :, :l])  # [n_local_heads, l, head_dim]
+                    v_packed.append(v[i, :, :l])
+                
+                q_packed = torch.cat(q_packed, dim=1).transpose(0, 1).contiguous()  # [total_q, n_head, head_dim]
+                k_packed = torch.cat(k_packed, dim=1).transpose(0, 1).contiguous()  # [total_k, n_local_heads, head_dim]
+                v_packed = torch.cat(v_packed, dim=1).transpose(0, 1).contiguous()
+            else:
+                # All sequences are of full length
+                cu_seqlens = torch.arange(0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=x.device)
+                max_seqlen = seqlen
+                q_packed = q.reshape(-1, self.n_head, self.head_dim)  # [bsz*seqlen, n_head, head_dim]
+                k_packed = k.reshape(-1, self.n_local_heads, self.head_dim)
+                v_packed = v.reshape(-1, self.n_local_heads, self.head_dim)
+
+            # Compute attention with packed sequences
+            y_packed = flash_attn_varlen_func(
+                q_packed,
+                k_packed,
+                v_packed,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=True,
+                dropout_p=0.0,
+                softmax_scale=None,  # Defaults to 1/sqrt(head_dim)
+            )
+
+            # Unpack the output
+            if input_lengths is not None:
+                y = torch.zeros(bsz, self.n_head, seqlen, self.head_dim, device=x.device, dtype=x.dtype)
+                offset = 0
+                for i in range(bsz):
+                    l = input_lengths[i].item()
+                    y[i, :, :l] = y_packed[offset:offset+l].transpose(0, 1)
+                    offset += l
+            else:
+                y = y_packed.view(bsz, self.n_head, seqlen, self.head_dim)
+
+            # Update KV cache with non-padded tokens
+            for i in range(bsz):
+                l = input_lengths[i].item() if input_lengths is not None else seqlen
+                self.kv_cache.k_cache[i, :, :l] = k[i, :, :l]
+                self.kv_cache.v_cache[i, :, :l] = v[i, :, :l]
+
+            # Transpose to [bsz, seqlen, n_head, head_dim]
+            y = y.transpose(1, 2).contiguous()
+
+        # Combine heads and project output
+        y = y.reshape(bsz, seqlen, self.dim)
         y = self.wo(y)
         return y
-
 
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -291,7 +363,8 @@ def precompute_freqs_cis(
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    # Reshape freqs_cis to [B, S, 1, n_elem//2, 2] for broadcasting
+    freqs_cis = freqs_cis.unsqueeze(2)
     x_out2 = torch.stack(
         [
             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
