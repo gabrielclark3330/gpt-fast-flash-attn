@@ -65,10 +65,10 @@ def roundup(val, multiplier):
 def causal_mask(b, h, q, kv):
     return q >= kv
 
-def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
+def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, input_lengths, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
     mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=x.device)
-    logits = model(mask, x, input_pos)
+    logits = model(x, input_pos, input_lengths)
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, block_mask: BlockMask, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -78,7 +78,7 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
     mask = block_mask[:, :, block_index]
     mask.mask_mod = block_mask.mask_mod
     mask.seq_lengths = (1, model.max_seq_length)
-    logits = model(mask, x, input_pos)
+    logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
@@ -161,6 +161,7 @@ def generate(
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
+    input_lengths=None,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -185,18 +186,16 @@ def generate(
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty(batch_size, T_new, dtype=dtype, device=device)
-    # We are just making the same prompt for every batch
-    prompt = prompt.view(1, -1).repeat(batch_size, 1)
     empty[:, :T] = prompt
     seq = empty
     input_pos = torch.arange(0, T, device=device)
+    input_pos = input_pos.unsqueeze(0).repeat(batch_size, 1)
 
-    next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    next_token = prefill(model, prompt, input_pos, input_lengths, **sampling_kwargs).clone()
     if is_speculative:
-        prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+        prefill(draft_model, prompt, input_pos, **sampling_kwargs)
     seq[:, T] = next_token.squeeze()
-
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    input_pos = torch.tensor([[x+1] for x in input_lengths], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
 
     if is_speculative:
@@ -334,12 +333,23 @@ def main(
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 
-    if isinstance(prompt, str):
-        encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    else:
-        # generate a fully synthetic prompt
-        encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
-    prompt_length = encoded.size(-1)
+    #prompts = ["The", "The apple is good"]
+    prompts = ["James what is that on", "Identify the Issue: The KV cache isn't updated during the prefill phase because the update code is commented out. In the forward method of the Attention class, uncomment the lines that check for self.kv_cache and update it with the current keys (k)"]
+    batch_size = len(prompts)
+    encoded_prompts = []
+    for p in prompts:
+        encoded = encode_tokens(tokenizer, p, bos=True, device=device)
+        encoded_prompts.append(encoded)
+
+    input_lengths = [len(x) for x in encoded_prompts]
+
+    max_length = max(tensor.size(0) for tensor in encoded_prompts)
+    padded_batch = torch.zeros((len(encoded_prompts), max_length), dtype=encoded.dtype, device=device)
+    for i, tensor in enumerate(encoded_prompts):
+        padded_batch[i, :tensor.size(0)] = tensor
+    print(f"{padded_batch=}")
+    prompts = padded_batch
+    prompt_length = prompts.size(-1)
 
     torch.manual_seed(1234)
     model_size, params = _get_model_size(model)
@@ -400,7 +410,7 @@ def main(
         with prof:
             y, metrics = generate(
                 model,
-                encoded,
+                prompts,
                 max_new_tokens,
                 batch_size=batch_size,
                 draft_model=draft_model,
@@ -409,6 +419,7 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                input_lengths=input_lengths
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
@@ -423,10 +434,8 @@ def main(
         t = time.perf_counter() - t0
 
         if not interactive:
-            # Just displaying the first generation
-            if batch_size > 1:
-                print("Only displaying the first generation of the batch")
-            print(tokenizer.decode(y[0].tolist()))
+            for i in range(y.shape[0]):
+                print(f"Batch el {i}: {tokenizer.decode(y[i].tolist())}")
         else:
             print()
         tokens_generated = y.size(-1) - prompt_length
